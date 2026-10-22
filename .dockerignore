@@ -11,3 +11,5 @@ tests/
 *.log
 *.sql.gz
 *.dump
+backups/
+*.backup

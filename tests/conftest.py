@@ -28,6 +28,7 @@ def configuration(monkeypatch):
     monkeypatch.setattr(app, "IT", {ADMIN, TECH, OTHER_TECH})
     monkeypatch.setattr(app, "GROUP_ID", GROUP)
     monkeypatch.setattr(app, "delivery_lock", asyncio.Lock())
+    monkeypatch.setattr(app, "DELIVERY_SPACING_SECONDS", 0)
     app.access.windows.clear()
 
 

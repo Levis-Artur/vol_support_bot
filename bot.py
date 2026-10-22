@@ -25,6 +25,8 @@ router = Router()
 pool = None
 logger = logging.getLogger(__name__)
 delivery_lock = asyncio.Lock()
+DAILY_TICKET_LIMIT = 5
+DELIVERY_SPACING_SECONDS = 1
 
 
 class DrainMiddleware(BaseMiddleware):
@@ -64,7 +66,7 @@ class AccessMiddleware(BaseMiddleware):
         message = event.message if isinstance(event, CallbackQuery) else event
         if not user or user.is_bot or not isinstance(message, Message) or message.sender_chat:
             return
-        if message.chat.type != ChatType.PRIVATE and message.chat.id != user.id:
+        if message.chat.type == ChatType.PRIVATE and message.chat.id != user.id:
             return
         # /id is harmless and is needed to discover a new group's ID.
         if (message.chat.type != ChatType.PRIVATE and message.chat.id != GROUP_ID
@@ -109,7 +111,7 @@ async def handle_error(event):
         safe_error("Error response", error)
     return True
 CATEGORIES = ["Комп'ютер", "Принтер", "Мережа", "ПЗ", "Інше"]
-STATUSES = {"pending_verification": "⏳ Очікує перевірки", "new": "🆕 Нова",
+STATUSES = {"pending_verification": "Архівна заявка", "new": "🆕 Нова",
             "in_progress": "🔧 В роботі", "waiting": "⏸ Очікування",
             "done": "✅ Виконана", "cancelled": "🚫 Скасована"}
 
@@ -188,7 +190,7 @@ async def update_group_message(bot, tid):
 
 
 async def deliver_ticket(bot, tid, *, group):
-    # One process; DB row locks also serialize delivery with approve/reject/status.
+    # One process; DB row locks also serialize delivery with blocking/status changes.
     # Lock order is always creator then ticket. Telegram cannot provide exactly-once sends.
     async with delivery_lock, pool.acquire() as conn, conn.transaction():
         creator = await conn.fetchval("SELECT creator_id FROM tickets WHERE id=$1", tid)
@@ -212,7 +214,7 @@ async def deliver_ticket(bot, tid, *, group):
                 logger.warning("Private delivery unavailable")
             await conn.execute("UPDATE tickets SET user_notified_status=status WHERE id=$1", tid)
             return True
-        if not user["verified"] or t["status"] == "pending_verification":
+        if t["status"] == "pending_verification":
             return False
         if not t["group_message_id"] and t["status"] != "new":
             return False
@@ -255,12 +257,12 @@ async def retry_deliveries(bot):
         rows = await conn.fetch("""SELECT t.id FROM tickets t JOIN users u ON u.telegram_id=t.creator_id
           WHERE NOT u.blocked AND t.next_delivery_at <= now() AND
           (t.user_notified_status IS DISTINCT FROM t.status OR
-           (u.verified AND t.status <> 'pending_verification' AND
+           (t.status <> 'pending_verification' AND
             ((t.status='new' AND t.group_message_id IS NULL) OR
              (t.group_message_id IS NOT NULL AND
               (t.group_synced_status IS DISTINCT FROM t.status OR
                (t.photo_file_id IS NOT NULL AND t.group_photo_message_id IS NULL))))))
-          ORDER BY t.next_delivery_at,t.id LIMIT 50""")
+          ORDER BY t.next_delivery_at,t.id LIMIT 5""")
     sent = 0
     for row in rows:
         # Rotate failures so one bad recipient cannot starve the rest of the queue.
@@ -271,6 +273,7 @@ async def retry_deliveries(bot):
         except Exception as error:
             safe_error("Retry group delivery", error)
         await notify_ticket(bot, row["id"])
+        await asyncio.sleep(DELIVERY_SPACING_SECONDS)
     return sent
 
 
@@ -295,10 +298,8 @@ async def start(m: Message, state: FSMContext):
     u = await get_user(m.from_user.id)
     if u["blocked"]:
         return await m.answer("Ваш доступ обмежено. Зверніться до адміністратора.")
-    if not u["verified"]:
-        await m.answer("🔐 Ви ще не підтверджені адміністратором. Можете подати заявку, "
-                       "але вона потрапить до ІТ-черги лише після перевірки.")
-    await m.answer("Вітаємо у Support Bot УПП м. Луцьк.", reply_markup=menu())
+    await m.answer("Вітаємо у Support Bot УПП м. Луцьк. Можете одразу створити заявку. "
+                   "Ліміт — 5 заявок за 24 години.", reply_markup=menu())
 
 @router.message(Command("id"))
 async def chat_id(m: Message):
@@ -407,10 +408,10 @@ async def form_submit(m: Message, state: FSMContext, bot: Bot):
                 return await m.answer(f"Заявку #{existing:06} уже збережено. Перегляд: /my.")
             count = await conn.fetchval("""SELECT count(*) FROM tickets
                 WHERE creator_id=$1 AND created_at >= now() - interval '24 hours'""", uid)
-            if count >= (20 if u["verified"] else 3):
+            if count >= DAILY_TICKET_LIMIT:
                 await state.clear()
                 return await m.answer("Ліміт заявок за останні 24 години вичерпано.")
-            status = "new" if u["verified"] else "pending_verification"
+            status = "new"
             await conn.execute("""UPDATE users SET full_name=$2,department=$3 WHERE telegram_id=$1""",
                                uid, d["full_name"], d["department"])
             tid = await conn.fetchval("""INSERT INTO tickets
@@ -425,11 +426,10 @@ async def form_submit(m: Message, state: FSMContext, bot: Bot):
     await m.answer(f"✅ Заявку #{tid:06} збережено.\nСтатус: {STATUSES[status]}",reply_markup=menu())
     async with pool.acquire() as conn:
         await conn.execute("UPDATE tickets SET user_notified_status=$2 WHERE id=$1 AND status=$2", tid, status)
-    if status == "new":
-        try:
-            await publish_ticket(bot, tid)
-        except Exception as error:
-            safe_error("Publish", error)
+    try:
+        await publish_ticket(bot, tid)
+    except Exception as error:
+        safe_error("Publish", error)
 
 async def show_my(bot, uid):
     user = await get_user(uid)
@@ -496,7 +496,7 @@ async def change_status(c: CallbackQuery, bot: Bot):
                 return await c.answer("Доступ обмежено.", show_alert=True)
             eligible = await conn.fetchval("""SELECT telegram_id FROM users
                 WHERE telegram_id=(SELECT creator_id FROM tickets WHERE id=$1)
-                AND verified AND NOT blocked FOR NO KEY UPDATE""", tid)
+                AND NOT blocked FOR NO KEY UPDATE""", tid)
             if not eligible:
                 return await c.answer("Заявка недоступна.", show_alert=True)
             t = await conn.fetchrow("SELECT * FROM tickets WHERE id=$1 FOR UPDATE",tid)
@@ -506,7 +506,7 @@ async def change_status(c: CallbackQuery, bot: Bot):
                 return await c.answer("Ця кнопка застаріла.", show_alert=True)
             old = t["status"]
             if old in ("done","cancelled","pending_verification"):
-                return await c.answer("Заявку вже закрито або не підтверджено.",show_alert=True)
+                return await c.answer("Заявку вже закрито або вона недоступна.",show_alert=True)
             if old_expected and old != old_expected:
                 return await c.answer("Статус уже змінився.",show_alert=True)
             if action in ("done","cancel") and old not in ("new","in_progress","waiting"):
@@ -549,87 +549,49 @@ async def queue(m: Message):
     async with pool.acquire() as conn:
         rows = await conn.fetch("""SELECT t.id,t.status,t.category FROM tickets t
         JOIN users u ON u.telegram_id=t.creator_id
-        WHERE u.verified AND NOT u.blocked AND t.status IN ('new','in_progress','waiting')
+        WHERE NOT u.blocked AND t.status IN ('new','in_progress','waiting')
         ORDER BY t.created_at,t.id LIMIT 20""")
     await m.answer("\n".join(f"#{r['id']:06} {STATUSES[r['status']]} — {esc(r['category'])}"
                    for r in rows) if rows else "Черга порожня.")
 
-@router.message(Command("pending"))
-async def pending(m: Message):
+async def set_user_blocked(m: Message, bot: Bot, *, blocked: bool):
     if not await staff_allowed(m, admin=True, private=True):
         return
+    action = "block" if blocked else "unblock"
     try:
-        after = command_id(m.text) if len((m.text or "").split()) > 1 else 0
+        uid = command_id(m.text)
     except ValueError:
-        return await m.answer("Використання: /pending або /pending TELEGRAM_ID (наступна сторінка)")
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""SELECT u.telegram_id,u.full_name,u.department,
-          count(t.id) AS tickets FROM users u
-          LEFT JOIN tickets t ON t.creator_id=u.telegram_id AND t.status='pending_verification'
-          WHERE u.verified=false AND u.blocked=false AND u.telegram_id > $1
-          GROUP BY u.telegram_id ORDER BY u.telegram_id LIMIT 5""", after)
-    if not rows:
-        return await m.answer("Непідтверджених користувачів немає.")
-    await m.answer("\n".join(f"ID <code>{r['telegram_id']}</code> | {esc(r['full_name'])}"
-       f" | {esc(r['department'])} | заявок: {r['tickets']}" for r in rows)
-       + "\nДля підтвердження: /approve TELEGRAM_ID"
-       + f"\nНаступна сторінка: /pending {rows[-1]['telegram_id']}")
-
-@router.message(Command("approve"))
-async def approve(m: Message, bot: Bot):
-    if not await staff_allowed(m, admin=True, private=True):
-        return
-    try:
-        uid = command_id(m.text)
-    except (ValueError, IndexError):
-        return await m.answer("Використання: /approve 123456789")
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            u = await conn.fetchrow("SELECT * FROM users WHERE telegram_id=$1 FOR NO KEY UPDATE",uid)
-            if not u or u["blocked"]:
-                return await m.answer("Користувача не знайдено або він заблокований.")
-            await conn.execute("UPDATE users SET verified=true WHERE telegram_id=$1",uid)
-            await conn.execute("INSERT INTO user_events(user_id,actor_id,action) VALUES($1,$2,'approve')", uid, m.from_user.id)
-            pending = await conn.fetch("""UPDATE tickets SET status='new',updated_at=now(),next_delivery_at=now()
-              WHERE creator_id=$1 AND status='pending_verification' RETURNING id""",uid)
-            for row in pending:
-                await conn.execute("""INSERT INTO ticket_events(ticket_id,actor_id,
-                  old_status,new_status) VALUES($1,$2,'pending_verification','new')""",
-                  row["id"],m.from_user.id)
-    await m.answer(f"✅ Користувача {uid} підтверджено. Заявок: {len(pending)}.")
-    await inform_user(bot,uid,"✅ Ваш обліковий запис підтверджено. Заявки поставлено в чергу доставки ІТ-відділу.")
-    for row in pending:
-        try:
-            await publish_ticket(bot,row["id"])
-        except Exception as error:
-            safe_error("Approved ticket delivery", error)
-        await notify_ticket(bot,row["id"])
-
-@router.message(Command("reject"))
-async def reject(m: Message, bot: Bot):
-    if not await staff_allowed(m, admin=True, private=True):
-        return
-    try:
-        uid = command_id(m.text)
-    except (ValueError, IndexError):
-        return await m.answer("Використання: /reject 123456789")
-    if uid in IT:
+        return await m.answer(f"Використання: /{action} TELEGRAM_ID")
+    if blocked and uid in IT:
         return await m.answer("Не можна блокувати ІТ/адміністратора.")
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id=$1 FOR NO KEY UPDATE", uid)
-            if not user:
-                return await m.answer("Користувача не знайдено.")
-            await conn.execute("UPDATE users SET blocked=true,verified=false WHERE telegram_id=$1",uid)
-            await conn.execute("INSERT INTO user_events(user_id,actor_id,action) VALUES($1,$2,'reject')", uid, m.from_user.id)
-            rows = await conn.fetch("""UPDATE tickets SET status='cancelled',updated_at=now()
-              WHERE creator_id=$1 AND status='pending_verification' RETURNING id""",uid)
-            for row in rows:
-                await conn.execute("""INSERT INTO ticket_events(ticket_id,actor_id,
-                  old_status,new_status) VALUES($1,$2,'pending_verification','cancelled')""",
-                  row["id"],m.from_user.id)
-    await m.answer(f"Користувача {uid} заблоковано; неперевірені заявки скасовано.")
-    await inform_user(bot,uid,"Доступ обмежено адміністратором. Неперевірені заявки скасовано.")
+    async with pool.acquire() as conn, conn.transaction():
+        if blocked:
+            # Allow preemptive blocking before /start, without changing an existing profile.
+            await conn.execute("INSERT INTO users(telegram_id) VALUES($1) ON CONFLICT DO NOTHING", uid)
+        user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id=$1 FOR NO KEY UPDATE", uid)
+        if not user:
+            return await m.answer("Користувача не знайдено.")
+        if user["blocked"] == blocked:
+            return await m.answer("Користувача вже заблоковано." if blocked else "Користувач уже має доступ.")
+        await conn.execute("UPDATE users SET blocked=$2 WHERE telegram_id=$1", uid, blocked)
+        await conn.execute("INSERT INTO user_events(user_id,actor_id,action) VALUES($1,$2,$3)",
+                           uid, m.from_user.id, action)
+        if not blocked:
+            await conn.fetchval("SELECT release_legacy_tickets($1,$2)", uid, m.from_user.id)
+    await m.answer(f"Користувача {uid} заблоковано." if blocked else f"Користувача {uid} розблоковано.")
+    await inform_user(bot, uid, "Доступ обмежено адміністратором." if blocked
+                      else "Доступ відновлено. Можете створити заявку через /new.")
+
+
+@router.message(Command("block", "reject"))
+async def block(m: Message, bot: Bot):
+    await set_user_blocked(m, bot, blocked=True)
+
+
+@router.message(Command("unblock"))
+async def unblock(m: Message, bot: Bot):
+    await set_user_blocked(m, bot, blocked=False)
+
 
 @router.message(Command("sync"))
 async def sync(m: Message, bot: Bot):
@@ -646,6 +608,14 @@ async def stale_callback(c: CallbackQuery):
 @router.message(F.chat.type == ChatType.PRIVATE)
 async def fallback(m: Message):
     await m.answer("Команди: /start, /new, /my, /cancel, /id. Для нової заявки натисніть /new.")
+
+async def initialize_database(conn):
+    # Caller owns the transaction; no Telegram operations occur during migration.
+    await conn.execute((BASE_DIR / "schema.sql").read_text(encoding="utf-8"))
+    await conn.execute((BASE_DIR / "migrations" / "001_open_access.sql").read_text(encoding="utf-8"))
+    for uid in IT:
+        await conn.execute("INSERT INTO users(telegram_id) VALUES($1) ON CONFLICT DO NOTHING", uid)
+
 
 async def main():
     global pool, GROUP_ID, ADMINS, IT
@@ -668,11 +638,7 @@ async def main():
         pool = await asyncpg.create_pool(**settings.database, min_size=1, max_size=10,
                                         command_timeout=30, timeout=15, server_settings={"timezone": "UTC"})
         async with pool.acquire() as conn, conn.transaction():
-            await conn.execute((BASE_DIR / "schema.sql").read_text(encoding="utf-8"))
-            for uid in IT:
-                await conn.execute("""INSERT INTO users(telegram_id,verified)
-                    VALUES($1,true) ON CONFLICT(telegram_id)
-                    DO UPDATE SET verified=true,blocked=false""",uid)
+            await initialize_database(conn)
         bot = Bot(settings.token, session=AiohttpSession(timeout=15),
                   default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         dp.include_router(router)

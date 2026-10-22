@@ -5,5 +5,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN useradd --system --uid 10001 --create-home bot
 COPY bot.py config.py healthcheck.py telegram_ids.py schema.sql ./
+COPY migrations/ ./migrations/
 USER bot
 CMD ["python", "bot.py"]

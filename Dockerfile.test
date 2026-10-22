@@ -4,5 +4,6 @@ WORKDIR /app
 COPY requirements.txt requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
 COPY bot.py config.py healthcheck.py schema.sql docker-compose.yml pyproject.toml ./
+COPY migrations/ ./migrations/
 COPY tests/ ./tests/
 CMD ["python", "-m", "pytest", "-q"]

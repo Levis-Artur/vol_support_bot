@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS tickets (
  category TEXT NOT NULL,
  description TEXT NOT NULL,
  photo_file_id TEXT,
- status TEXT NOT NULL DEFAULT 'pending_verification'
+ status TEXT NOT NULL DEFAULT 'new'
   CHECK (status IN ('pending_verification','new','in_progress','waiting','done','cancelled')),
  assignee_id BIGINT REFERENCES users(telegram_id),
  group_message_id BIGINT,
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS user_events (
  id BIGSERIAL PRIMARY KEY,
  user_id BIGINT NOT NULL REFERENCES users(telegram_id),
  actor_id BIGINT NOT NULL,
- action TEXT NOT NULL CHECK (action IN ('approve','reject')),
+ action TEXT NOT NULL CHECK (action IN ('approve','reject','block','unblock')),
  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -57,7 +57,6 @@ DO $$ BEGIN
  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='users'::regclass AND conname='users_input_limits') THEN
   ALTER TABLE users ADD CONSTRAINT users_input_limits CHECK (
    telegram_id > 0 AND char_length(full_name) <= 100 AND char_length(department) <= 100
-   AND NOT (blocked AND verified)
   ) NOT VALID;
  END IF;
  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='tickets'::regclass AND conname='tickets_input_limits') THEN

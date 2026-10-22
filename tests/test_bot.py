@@ -72,15 +72,15 @@ async def test_create_ticket(verified, db, state, telegram, api, form_data, monk
     await state.update_data(**form_data)
     await app.form_submit(message().as_(telegram), state, api)
     insert = db.fetchval.await_args_list[-1]
-    assert insert.args[6] == ("new" if verified else "pending_verification")
+    assert insert.args[6] == "new"
     assert insert.args[1] == USER
     assert insert.args[7] == 101
     assert await state.get_state() is None
-    assert publish.await_count == int(verified)
+    publish.assert_awaited_once_with(api, 42)
     assert any("INSERT INTO ticket_events" in c.args[0] for c in db.execute.await_args_list)
 
 
-@pytest.mark.parametrize("verified,limit", [(False, 3), (True, 20)])
+@pytest.mark.parametrize("verified,limit", [(False, 5), (True, 5)])
 async def test_daily_limit(verified, limit, db, state, telegram, api, form_data):
     telegram.session.make_request = AsyncMock()
     db.fetchrow.return_value = dict(blocked=False, verified=verified)
@@ -143,7 +143,7 @@ async def test_invalid_transitions(status, assignee, action, mid, db, telegram, 
 
 
 @pytest.mark.parametrize("verified,blocked,status", [(False, False, "pending_verification"),
-    (False, False, "new"), (True, True, "new")])
+    (False, True, "new"), (True, True, "new")])
 async def test_no_group_leak(verified, blocked, status, db, api, ticket):
     ticket.update(status=status, group_message_id=None)
     db.fetchval.return_value = USER
@@ -178,40 +178,43 @@ async def test_unchanged_telegram_edit_is_success(db, api, ticket):
     assert "group_synced_status=status" in db.execute.await_args.args[0]
 
 
-@pytest.mark.parametrize("handler", [app.stats, app.queue, app.pending, app.approve, app.reject, app.sync])
+@pytest.mark.parametrize("handler", [app.stats, app.queue, app.block, app.unblock, app.sync])
 async def test_staff_commands_denied(handler, db, telegram, api):
     m = message().as_(telegram)
-    args = (m, api) if handler in (app.approve, app.reject, app.sync) else (m,)
+    args = (m, api) if handler in (app.block, app.unblock, app.sync) else (m,)
     await handler(*args)
     db.fetch.assert_not_awaited()
     db.execute.assert_not_awaited()
 
 
-async def test_pending_never_in_group(db, telegram):
-    await app.pending(message(ADMIN, "/pending", GROUP).as_(telegram))
-    db.fetch.assert_not_awaited()
+@pytest.mark.parametrize("handler,command", [(app.block, "/block"), (app.unblock, "/unblock")])
+async def test_moderation_never_in_group(handler, command, db, telegram, api):
+    await handler(message(ADMIN, f"{command} {USER}", GROUP).as_(telegram), api)
+    db.fetchrow.assert_not_awaited()
+    db.execute.assert_not_awaited()
 
 
-async def test_approve_releases_pending_and_audits(db, telegram, api, monkeypatch):
+@pytest.mark.parametrize("blocked", [True, False])
+async def test_moderation_audits_and_preserves_tickets(blocked, db, telegram, api):
+    telegram.session.make_request = AsyncMock()
+    db.fetchrow.side_effect = [dict(blocked=False), dict(blocked=not blocked)]
+    command = "/block" if blocked else "/unblock"
+    handler = app.block if blocked else app.unblock
+    await handler(message(ADMIN, f"{command} {USER}").as_(telegram), api)
+    assert any(c.args == ("UPDATE users SET blocked=$2 WHERE telegram_id=$1", USER, blocked)
+               for c in db.execute.await_args_list)
+    audit = db.execute.await_args_list[-1]
+    assert audit.args[1:] == (USER, ADMIN, "block" if blocked else "unblock")
+    assert not any("UPDATE tickets" in c.args[0] for c in db.execute.await_args_list)
+    if not blocked:
+        db.fetchval.assert_awaited_once_with("SELECT release_legacy_tickets($1,$2)", USER, ADMIN)
+
+
+async def test_cannot_block_staff(db, telegram, api):
     telegram.session.make_request = AsyncMock()
     db.fetchrow.return_value = dict(blocked=False)
-    db.fetch.return_value = [dict(id=1), dict(id=2)]
-    monkeypatch.setattr(app, "publish_ticket", AsyncMock())
-    monkeypatch.setattr(app, "notify_ticket", AsyncMock())
-    await app.approve(message(ADMIN, f"/approve {USER}").as_(telegram), api)
-    assert app.publish_ticket.await_count == 2
-    assert "status='pending_verification'" in db.fetch.await_args.args[0]
-    assert any("user_events" in c.args[0] for c in db.execute.await_args_list)
-
-
-async def test_reject_cancels_pending(db, telegram, api):
-    telegram.session.make_request = AsyncMock()
-    db.fetchrow.return_value = dict(blocked=False)
-    db.fetch.return_value = [dict(id=1)]
-    await app.reject(message(ADMIN, f"/reject {USER}").as_(telegram), api)
-    assert "status='cancelled'" in db.fetch.await_args.args[0]
-    assert "status='pending_verification'" in db.fetch.await_args.args[0]
-    assert any("blocked=true" in c.args[0] for c in db.execute.await_args_list)
+    await app.block(message(ADMIN, f"/block {TECH}").as_(telegram), api)
+    db.execute.assert_not_awaited()
 
 
 async def test_my_scoped_to_owner(db, api):
@@ -244,6 +247,25 @@ async def test_missing_callback_message(db, telegram):
     handler.assert_not_awaited()
 
 
+async def test_group_callbacks_pass_middleware_and_share_rate_limit(db, telegram):
+    telegram.session.make_request = AsyncMock()
+    db.fetchrow.return_value = dict(blocked=False)
+    middleware, handler = app.AccessMiddleware(), AsyncMock()
+    for _ in range(6):
+        await middleware(handler, message(TECH, "/queue", GROUP).as_(telegram), {})
+        await middleware(handler, callback(TECH).as_(telegram), {})
+    assert handler.await_count == 10
+
+
+@pytest.mark.parametrize("command", ["/pending", "/approve 999999"])
+async def test_removed_approval_commands_have_no_handler(command):
+    from aiogram.filters import Command
+    for handler in app.router.message.handlers:
+        for item in handler.filters:
+            if isinstance(item.callback, Command):
+                assert command.split()[0][1:] not in item.callback.commands
+
+
 async def test_stats_counts_and_month_timezone(db, telegram):
     telegram.session.make_request = AsyncMock()
     db.fetchrow.return_value = dict(blocked=False)
@@ -257,15 +279,24 @@ async def test_stats_counts_and_month_timezone(db, telegram):
     assert "Europe/Kyiv" in db.fetchval.await_args.args[0]
 
 
-async def test_pending_pagination_and_escaping(db, telegram):
+async def test_start_registers_without_approval(db, telegram, state):
     telegram.session.make_request = AsyncMock()
-    db.fetchrow.return_value = dict(blocked=False)
-    db.fetch.return_value = [dict(telegram_id=USER, full_name="<fake>", department="A&B", tickets=2)]
-    await app.pending(message(ADMIN, f"/pending {TECH}").as_(telegram))
-    text = telegram.session.make_request.await_args.args[1].text
-    assert "&lt;fake&gt;" in text and "A&amp;B" in text
-    assert f"/pending {USER}" in text
-    assert db.fetch.await_args.args[1] == TECH
+    db.fetchrow.return_value = dict(blocked=False, verified=False)
+    await app.start(message(text="/start").as_(telegram), state)
+    db.execute.assert_awaited_once()
+    assert "ON CONFLICT(telegram_id) DO NOTHING" in db.execute.await_args.args[0]
+    replies = [c.args[1].text for c in telegram.session.make_request.await_args_list]
+    assert len(replies) == 1 and "одразу" in replies[0]
+    assert not any("підтвердж" in text for text in replies)
+
+
+@pytest.mark.parametrize("verified", [False, True])
+async def test_delivery_ignores_legacy_verified_flag(verified, db, api, ticket):
+    ticket.update(group_message_id=None)
+    db.fetchval.return_value = USER
+    db.fetchrow.side_effect = [dict(verified=verified, blocked=False), ticket]
+    assert await app.publish_ticket(api, 1)
+    assert api.send_message.await_args.args[0] == GROUP
 
 
 async def test_blocked_submit(db, state, telegram, api, form_data):
@@ -328,10 +359,11 @@ def test_safe_logging(caplog):
     assert "PRIVATE_TOKEN_AND_TEXT" not in caplog.text
 
 
-async def test_real_dispatcher_fsm_and_duplicate_updates(db, telegram):
+async def test_real_dispatcher_fsm_and_duplicate_updates(db, telegram, monkeypatch):
     """Exercise actual aiogram filter ordering, FSM injection and event isolation."""
     telegram.session.make_request = AsyncMock()
     db.fetchrow.return_value = dict(verified=False, blocked=False)
+    monkeypatch.setattr(app, "publish_ticket", AsyncMock())
     dp = Dispatcher(events_isolation=app.SimpleEventIsolation())
     dp.include_router(app.router)
     try:
