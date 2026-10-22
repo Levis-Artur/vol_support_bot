@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Ensure committed environment file is empty
+        run: test -f .env && test ! -s .env
       - name: Validate isolated test configuration
         run: docker compose -p support-bot-tests -f docker-compose.test.yml config --quiet
       - name: Run unit and PostgreSQL integration tests
