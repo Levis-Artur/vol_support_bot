@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: support
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      POSTGRES_DB: support
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support -d support"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+  bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN in .env}
+      IT_GROUP_ID: ${IT_GROUP_ID:?Set IT_GROUP_ID in .env}
+      ADMIN_IDS: ${ADMIN_IDS:?Set ADMIN_IDS in .env}
+      IT_IDS: ${IT_IDS:-}
+      DB_HOST: db
+      DB_USER: support
+      DB_NAME: support
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    init: true
+    stop_grace_period: 60s
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    depends_on:
+      db:
+        condition: service_healthy
+volumes:
+  pgdata:

@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.log
+*.dump
+*.sql.gz
+backups/
+*.backup
+*.pem
+*.key
+.ssh/

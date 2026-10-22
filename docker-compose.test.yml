@@ -1,0 +1,24 @@
+# Isolated, disposable database. No production .env, token, volume or host port.
+services:
+  test-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: support_test
+      POSTGRES_DB: support_test
+      POSTGRES_HOST_AUTH_METHOD: trust
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support_test -d support_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      TEST_DATABASE_URL: postgresql://support_test@test-db:5432/support_test
+    depends_on:
+      test-db:
+        condition: service_healthy

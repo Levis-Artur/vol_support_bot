@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.git
+.env.*
+!.env.example
+.venv*
+.pytest_cache
+.ruff_cache
+tests/
+*.log
+*.sql.gz
+*.dump

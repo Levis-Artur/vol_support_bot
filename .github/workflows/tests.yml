@@ -1,0 +1,24 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Validate isolated test configuration
+        run: docker compose -p support-bot-tests -f docker-compose.test.yml config --quiet
+      - name: Run unit and PostgreSQL integration tests
+        run: docker compose -p support-bot-tests -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from tests
+      - name: Lint
+        run: docker compose -p support-bot-tests -f docker-compose.test.yml run --rm --no-deps tests python -m ruff check .
